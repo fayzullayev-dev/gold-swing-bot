@@ -1,7 +1,9 @@
 import os
 import json
 import time
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np
 import pandas as pd
 import requests
@@ -13,26 +15,20 @@ import yfinance as yf
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9040646501:AAHyg3y78jRDX8D_SVuWdKxp0ZGXCzqwedo")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7037914269")
 
-# Тикер золота: фьючерс GC=F на Yahoo Finance (торгуется 24/5 без ключей API)
 SYMBOL = "GC=F"
 INTERVAL = "5m"
 PERIOD = "5d"
-
-POLL_INTERVAL_SEC = 20  # Опрос каждые 20 секунд
+POLL_INTERVAL_SEC = 20
 STATE_FILE = "last_circle.json"
 
-# ═══════════════════════════════════════════════════════════════════
-# 2. ПАРАМЕТРЫ СТРАТЕГИИ (ТОЧНО КАК В GOLD SWING v7)
-# ═══════════════════════════════════════════════════════════════════
+# Параметры индикатора Gold Swing v7
 ATR_LEN = 20
 SWING_K = 4.0
 COOLDOWN = 15
-
 USE_ADX = True
 ADX_LEN = 14
 ADX_MIN = 20.0
 USE_DI = True
-
 ENTRY_N = 8
 SL_BUF = 0.5
 PIP_SIZE = 0.1
@@ -40,7 +36,27 @@ EXIT_PIPS = 80
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 3. СОСТОЯНИЕ (ЗАЩИТА ОТ ДУБЛЕЙ ПРИ ПЕРЕЗАПУСКЕ)
+# 2. МИНИ-ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО ТАРИФА (WEB SERVICE)
+# ═══════════════════════════════════════════════════════════════════
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Gold Swing v7 Monitor is Running 24/7!")
+
+    def log_message(self, format, *args):
+        pass  # Отключаем спам в логи от пингов
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════════
 def load_last_sent_timestamp() -> str | None:
     if os.path.exists(STATE_FILE):
@@ -57,30 +73,18 @@ def save_last_sent_timestamp(bar_ts: str):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"last_bar_ts": bar_ts}, f)
     except Exception as e:
-        print("Ошибка сохранения last_circle.json:", e)
+        print("Ошибка сохранения состояния:", e)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 4. ОТПРАВКА СООБЩЕНИЙ В TELEGRAM
-# ═══════════════════════════════════════════════════════════════════
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-        if resp.status_code != 200:
-            print(f"Ошибка Telegram ({resp.status_code}):", resp.text)
+        requests.post(url, json=payload, timeout=15)
     except Exception as e:
         print("Ошибка отправки Telegram:", e)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 5. РАСЧЕТ ИНДИКАТОРОВ (СГЛАЖИВАНИЕ УАЙЛДЕРА / RMA)
-# ═══════════════════════════════════════════════════════════════════
 def compute_indicators(df: pd.DataFrame):
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
@@ -93,7 +97,6 @@ def compute_indicators(df: pd.DataFrame):
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
 
-    # Wilder's RMA (эквивалент ta.atr и ta.rma в Pine Script v6)
     atr = tr.ewm(alpha=1.0 / ATR_LEN, adjust=False).mean()
 
     up_move = high.diff()
@@ -115,9 +118,6 @@ def compute_indicators(df: pd.DataFrame):
     return atr, plus_di, minus_di, adx
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 6. ЛОГИКА СИГНАЛА «КРУГ» (GOLD SWING v7)
-# ═══════════════════════════════════════════════════════════════════
 def detect_circles(df: pd.DataFrame):
     atr, di_plus, di_minus, adx = compute_indicators(df)
 
@@ -160,7 +160,6 @@ def detect_circles(df: pd.DataFrame):
         buy_sig = False
         sig_price = np.nan
 
-        # ZigZag по порогу ATR
         if dir_zz == 1:
             if h > ext_hi:
                 ext_hi = h
@@ -178,7 +177,6 @@ def detect_circles(df: pd.DataFrame):
                 dir_zz = 1
                 ext_hi = h
 
-        # Фильтры разворота
         adx_ok = (not USE_ADX) or (not np.isnan(adx_arr[i]) and adx_arr[i] >= ADX_MIN)
         spaced = (i - last_sig_idx) >= COOLDOWN
         di_buy = (not USE_DI) or (dip_arr[i] > dim_arr[i])
@@ -190,27 +188,23 @@ def detect_circles(df: pd.DataFrame):
         if f_sell or f_buy:
             last_sig_idx = i
 
-        # Отмена ожидания входа при пробое пивота
         if p_dir == 1 and l < p_piv:
             p_dir = 0
         if p_dir == -1 and h > p_piv:
             p_dir = 0
 
-        # Контроль виртуальной позиции (освобождение слота tDir == 0)
         hit_sl = t_dir != 0 and ((t_dir == 1 and l <= t_sl) or (t_dir == -1 and h >= t_sl))
         hit_tp = t_dir != 0 and (not hit_sl) and ((t_dir == 1 and h >= t_tp) or (t_dir == -1 and l <= t_tp))
         hit_rev = t_dir != 0 and (not hit_sl) and (not hit_tp) and ((t_dir == 1 and f_sell) or (t_dir == -1 and f_buy))
         if hit_sl or hit_tp or hit_rev:
             t_dir = 0
 
-        # Постановка ожидания входа через ENTRY_N свечей
         if f_buy or f_sell:
             p_dir = 1 if f_buy else -1
             p_idx = i + ENTRY_N
             p_piv = sig_price
             p_sl = (sig_price - SL_BUF * cur_atr) if f_buy else (sig_price + SL_BUF * cur_atr)
 
-        # Момент появления «КРУГА» (вход на баре p_idx при условии p_dir != 0 и t_dir == 0)
         if p_dir != 0 and i == p_idx:
             if t_dir == 0:
                 t_dir = p_dir
@@ -229,18 +223,9 @@ def detect_circles(df: pd.DataFrame):
     return circles
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 7. ПОЛУЧЕНИЕ ТОЛЬКО ЗАКРЫТЫХ СВЕЧЕЙ ЧЕРЕЗ API
-# ═══════════════════════════════════════════════════════════════════
 def fetch_closed_candles() -> pd.DataFrame | None:
     try:
-        raw = yf.download(
-            tickers=SYMBOL,
-            period=PERIOD,
-            interval=INTERVAL,
-            progress=False,
-            auto_adjust=False
-        )
+        raw = yf.download(tickers=SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False)
         if raw is None or raw.empty:
             return None
         if isinstance(raw.columns, pd.MultiIndex):
@@ -248,41 +233,31 @@ def fetch_closed_candles() -> pd.DataFrame | None:
         raw = raw.dropna(subset=["Open", "High", "Low", "Close"])
         if len(raw) < 60:
             return None
-        # Исключаем последнюю незакрытую формирующуюся свечу (Once Per Bar Close)
         return raw.iloc[:-1].copy()
     except Exception as e:
-        print(f"Ошибка загрузки данных через Yahoo Finance: {e}")
+        print(f"Ошибка загрузки данных: {e}")
         return None
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 8. ОСНОВНОЙ ЦИКЛ 24/7
+# 4. ЦИКЛ МОНИТОРИНГА
 # ═══════════════════════════════════════════════════════════════════
-def main():
-    print("=" * 60)
-    print("🤖 МОНИТОР СИГНАЛА «КРУГ» (GOLD SWING v7) В ОБЛАКЕ 24/7")
-    print(f"Инструмент: Золото ({SYMBOL}) | Таймфрейм: {INTERVAL}")
-    print("=" * 60)
-
-    # Приветственное сообщение в Telegram
+def monitor_loop():
+    print("Запуск мониторинга Gold Swing v7...")
     start_msg = (
         f"🚀 <b>Монитор Gold Swing v7 запущен 24/7!</b>\n"
         f"<b>Инструмент:</b> Золото ({SYMBOL}) M5\n"
-        f"<b>Режим:</b> Без ПК и без MT5 (прямой поток котировок)\n"
-        f"<b>Уведомления:</b> Только при появлении «КРУГА»"
+        f"<b>Режим:</b> Облачный (Render Free)"
     )
     send_telegram(start_msg)
 
     last_sent_ts = load_last_sent_timestamp()
-
-    # Фиксируем последний исторический круг на старте, чтобы не спамить старыми сигналами
     initial_df = fetch_closed_candles()
     if initial_df is not None and last_sent_ts is None:
         initial_circles = detect_circles(initial_df)
         if initial_circles:
             last_sent_ts = initial_circles[-1]["bar_ts"]
             save_last_sent_timestamp(last_sent_ts)
-            print(f"Последний исторический круг зафиксирован ({last_sent_ts}). Ожидаем новые сигналы...")
 
     while True:
         try:
@@ -291,7 +266,6 @@ def main():
                 circles = detect_circles(df)
                 if circles:
                     latest = circles[-1]
-                    # Отправляем только если этот круг еще не отправлялся
                     if latest["bar_ts"] != last_sent_ts:
                         last_sent_ts = latest["bar_ts"]
                         save_last_sent_timestamp(last_sent_ts)
@@ -299,19 +273,20 @@ def main():
                         msg = (
                             f"{latest['side']}\n"
                             f"<b>Инструмент:</b> XAUUSD (M5)\n"
-                            f"<b>Время закрытия свечи:</b> <code>{latest['bar_ts']}</code>\n"
+                            f"<b>Время закрытия:</b> <code>{latest['bar_ts']}</code>\n"
                             f"<b>Вход (Close):</b> <code>{latest['entry']:.2f}</code>\n"
-                            f"<b>Круг на уровне пивота:</b> <code>{latest['pivot']:.2f}</code>\n"
+                            f"<b>Круг (Пивот):</b> <code>{latest['pivot']:.2f}</code>\n"
                             f"<b>Ориентир SL:</b> <code>{latest['sl']:.2f}</code> | <b>TP:</b> <code>{latest['tp']:.2f}</code>"
                         )
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Сработал сигнал!")
-                        print(msg)
                         send_telegram(msg)
         except Exception as e:
-            print("Ошибка в цикле мониторинга:", e)
+            print("Ошибка цикла:", e)
 
         time.sleep(POLL_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    main()
+    bot_thread = threading.Thread(target=monitor_loop, daemon=True)
+    bot_thread.start()
+
+    run_web_server()
