@@ -16,7 +16,7 @@ import pytz
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9040646501:AAHyg3y78jRDX8D_SVuWdKxp0ZGXCzqwedo")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7037914269")
 
-# Ташкентский часовой пояс (UTC+5)
+# Часовой пояс Ташкента (UTC+5)
 TIMEZONE_TASHKENT = pytz.timezone("Asia/Tashkent")
 
 INTERVAL = "5m"
@@ -25,9 +25,8 @@ POLL_INTERVAL_SEC = 20
 STATE_FILE = "last_circle.json"
 
 # ═══════════════════════════════════════════════════════════════════
-# 2. СПИСОК ИНСТРУМЕНТОВ И ИХ ПАРАМЕТРЫ (КАК В PINE SCRIPT v6)
+# 2. СПИСОК ИНСТРУМЕНТОВ И ИХ ПАРАМЕТРЫ
 # ═══════════════════════════════════════════════════════════════════
-# Золото (GC=F), Биткоин (BTC-USD), Индекс Доу-Джонса / US30 (YM=F)
 INSTRUMENTS = {
     "XAUUSD": {
         "ticker": "GC=F",
@@ -85,7 +84,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Gold Swing v7 Multi-Pair Monitor (XAUUSD, BTCUSD, US30) is Active 24/7!")
+        self.wfile.write(b"Gold Swing v7 Immediate Signal Monitor is Active 24/7!")
 
     def log_message(self, format, *args):
         pass
@@ -98,7 +97,7 @@ def run_web_server():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 4. СОХРАНЕНИЕ И ОТПРАВКА СОСТОЯНИЯ
+# 4. СОСТОЯНИЕ И ОТПРАВКА В TELEGRAM
 # ═══════════════════════════════════════════════════════════════════
 def load_all_states() -> dict:
     if os.path.exists(STATE_FILE):
@@ -130,7 +129,7 @@ def send_telegram(text: str):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. РАСЧЕТ ИНДИКАТОРОВ (СТРОГО КАК В PINE SCRIPT v6)
+# 5. ИНДИКАТОРЫ (RMA УАЙЛДЕРА)
 # ═══════════════════════════════════════════════════════════════════
 def compute_indicators(df: pd.DataFrame, atr_len: int, adx_len: int):
     high = df["High"].astype(float)
@@ -144,7 +143,6 @@ def compute_indicators(df: pd.DataFrame, atr_len: int, adx_len: int):
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
 
-    # Wilder's RMA (Pine Script ta.atr и ta.rma)
     atr = tr.ewm(alpha=1.0 / atr_len, adjust=False).mean()
 
     up_move = high.diff()
@@ -167,9 +165,13 @@ def compute_indicators(df: pd.DataFrame, atr_len: int, adx_len: int):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 6. ЛОГИКА СИГНАЛА «КРУГ» (GOLD SWING v7 — 1 В 1)
+# 6. ЛОГИКА СИГНАЛА В МОМЕНТ РАЗВОРОТА (fBuy / fSell)
 # ═══════════════════════════════════════════════════════════════════
-def detect_circles(df: pd.DataFrame, cfg: dict):
+def detect_immediate_signals(df: pd.DataFrame, cfg: dict):
+    """
+    Отслеживает фиксацию разворота fBuy / fSell (alertcondition fBuy/fSell)
+    и отправляет сигнал СРАЗУ, в момент подтверждения разворота (без 40-минутной задержки).
+    """
     atr, di_plus, di_minus, adx = compute_indicators(df, cfg["atrLen"], cfg["adxLen"])
 
     highs = df["High"].to_numpy(dtype=float)
@@ -191,17 +193,7 @@ def detect_circles(df: pd.DataFrame, cfg: dict):
     ext_lo_b = 0
 
     last_sig_idx = -100000
-    t_dir = 0
-    t_sl = np.nan
-    t_tp = np.nan
-
-    p_dir = 0
-    p_bar = None
-    p_sl = np.nan
-    p_piv = np.nan
-    p_piv_b = None
-
-    circles = []
+    signals = []
 
     for i in range(1, n):
         h, l, c = highs[i], lows[i], closes[i]
@@ -215,7 +207,6 @@ def detect_circles(df: pd.DataFrame, cfg: dict):
         sig_price = np.nan
         sig_bar = None
 
-        # ───── ZigZag ─────
         if dir_zz == 1:
             if h > ext_hi:
                 ext_hi = h
@@ -239,7 +230,6 @@ def detect_circles(df: pd.DataFrame, cfg: dict):
                 ext_hi = h
                 ext_hi_b = i
 
-        # ───── Фильтры ─────
         adx_ok = (not cfg["useAdx"]) or (not np.isnan(adx_arr[i]) and adx_arr[i] >= cfg["adxMin"])
         spaced = (i - last_sig_idx) >= cfg["cooldown"]
         di_buy = (not cfg["useDi"]) or (dip_arr[i] > dim_arr[i])
@@ -251,50 +241,26 @@ def detect_circles(df: pd.DataFrame, cfg: dict):
         if f_sell or f_buy:
             last_sig_idx = i
 
-        # 0) Отмена ожидания: до входа цена пробила точку разворота
-        if p_dir == 1 and l < p_piv:
-            p_dir = 0
-        if p_dir == -1 and h > p_piv:
-            p_dir = 0
+            # Расчёт SL и TP в момент сигнала
+            sl_price = (sig_price - cfg["slBuf"] * cur_atr) if f_buy else (sig_price + cfg["slBuf"] * cur_atr)
+            direction = 1 if f_buy else -1
+            tp_price = c + direction * cfg["exitPips"] * cfg["pipSize"]
 
-        # 1) Выход: стоп, тейк или новый принятый разворот
-        hit_sl = t_dir != 0 and ((t_dir == 1 and l <= t_sl) or (t_dir == -1 and h >= t_sl))
-        hit_tp = t_dir != 0 and (not hit_sl) and ((t_dir == 1 and h >= t_tp) or (t_dir == -1 and l <= t_tp))
-        hit_rev = t_dir != 0 and (not hit_sl) and (not hit_tp) and ((t_dir == 1 and f_sell) or (t_dir == -1 and f_buy))
-        if hit_sl or hit_tp or hit_rev:
-            t_dir = 0
+            # Точное ташкентское время (UTC+5)
+            signal_ts = df.index[i].tz_convert(TIMEZONE_TASHKENT).strftime("%Y-%m-%d %H:%M")
+            pivot_ts = df.index[sig_bar].tz_convert(TIMEZONE_TASHKENT).strftime("%H:%M") if sig_bar is not None else ""
 
-        # 2) Принятый разворот ставит ожидание входа через entryN баров
-        if f_buy or f_sell:
-            p_dir = 1 if f_buy else -1
-            p_bar = i + cfg["entryN"]
-            p_piv = sig_price
-            p_piv_b = sig_bar
-            p_sl = (sig_price - cfg["slBuf"] * cur_atr) if f_buy else (sig_price + cfg["slBuf"] * cur_atr)
+            signals.append({
+                "signal_ts": signal_ts,
+                "pivot_ts": pivot_ts,
+                "side": "🟢 КРУГ BUY (Разворот ВВЕРХ)" if f_buy else "🔴 КРУГ SELL (Разворот ВНИЗ)",
+                "cur_price": c,
+                "pivot": sig_price,
+                "sl": sl_price,
+                "tp": tp_price
+            })
 
-        # 3) Вход на бар p_bar: только если ожидание не отменено и позиции нет
-        if p_dir != 0 and i == p_bar:
-            if t_dir == 0:
-                t_dir = p_dir
-                t_sl = p_sl
-                t_tp = c + p_dir * cfg["exitPips"] * cfg["pipSize"]
-
-                # Переводим время бара входа и бара пивота в Ташкент (UTC+5)
-                entry_ts = df.index[i].tz_convert(TIMEZONE_TASHKENT).strftime("%Y-%m-%d %H:%M")
-                pivot_ts = df.index[p_piv_b].tz_convert(TIMEZONE_TASHKENT).strftime("%H:%M") if p_piv_b is not None else ""
-
-                circles.append({
-                    "entry_ts": entry_ts,
-                    "pivot_ts": pivot_ts,
-                    "side": "🟢 КРУГ BUY" if p_dir == 1 else "🔴 КРУГ SELL",
-                    "entry": c,
-                    "pivot": p_piv,
-                    "sl": t_sl,
-                    "tp": t_tp,
-                })
-            p_dir = 0
-
-    return circles
+    return signals
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -317,56 +283,53 @@ def fetch_closed_candles(ticker: str) -> pd.DataFrame | None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 8. ОСНОВНОЙ ЦИКЛ МОНИТОРИНГА 3-Х ПАР
+# 8. ЦИКЛ МОНИТОРИНГА
 # ═══════════════════════════════════════════════════════════════════
 def monitor_loop():
-    print("Запуск мультипарного мониторинга Gold Swing v7...")
+    print("Запуск мгновенного мониторинга Gold Swing v7...")
     start_msg = (
-        "🚀 <b>Мультипарный монитор Gold Swing v7 запущен!</b>\n\n"
-        "📊 <b>Отслеживаемые инструменты (M5):</b>\n"
-        "• 🟡 <b>Золото:</b> XAUUSD (GC=F)\n"
-        "• 🟠 <b>Биткоин:</b> BTCUSD\n"
-        "• 🔵 <b>Индекс:</b> US30 (Dow Jones)\n\n"
-        "🕒 <b>Часовой пояс:</b> Ташкент (UTC+5)\n"
-        "🎯 <b>Логика:</b> Точно по Pine Script v6 (сигнал КРУГ на баре входа)"
+        "⚡ <b>Монитор Gold Swing v7 обновлен: Мгновенные сигналы!</b>\n\n"
+        "🔔 <b>Режим оповещения:</b> Сигнал отправляется СРАЗУ в момент фиксации разворота (без 40-минутного ожидания entryN)!\n"
+        "📊 <b>Пары (M5):</b> XAUUSD | BTCUSD | US30\n"
+        "🕒 <b>Время:</b> Ташкент (UTC+5)"
     )
     send_telegram(start_msg)
 
     saved_states = load_all_states()
 
-    # Фиксируем последние исторические круги при старте для каждой пары
+    # Фиксируем последние сигналы при старте
     for sym_key, cfg in INSTRUMENTS.items():
         if sym_key not in saved_states:
             df = fetch_closed_candles(cfg["ticker"])
             if df is not None:
-                circles = detect_circles(df, cfg)
-                if circles:
-                    saved_states[sym_key] = circles[-1]["entry_ts"]
-                    save_symbol_state(sym_key, circles[-1]["entry_ts"])
-                    print(f"[{sym_key}] Зафиксирован прошлый сигнал: {saved_states[sym_key]}")
+                sigs = detect_immediate_signals(df, cfg)
+                if sigs:
+                    saved_states[sym_key] = sigs[-1]["signal_ts"]
+                    save_symbol_state(sym_key, sigs[-1]["signal_ts"])
+                    print(f"[{sym_key}] Предыдущий сигнал зафиксирован: {saved_states[sym_key]}")
 
     while True:
         for sym_key, cfg in INSTRUMENTS.items():
             try:
                 df = fetch_closed_candles(cfg["ticker"])
                 if df is not None:
-                    circles = detect_circles(df, cfg)
-                    if circles:
-                        latest = circles[-1]
+                    sigs = detect_immediate_signals(df, cfg)
+                    if sigs:
+                        latest = sigs[-1]
                         last_sent = saved_states.get(sym_key)
-                        if latest["entry_ts"] != last_sent:
-                            saved_states[sym_key] = latest["entry_ts"]
-                            save_symbol_state(sym_key, latest["entry_ts"])
+                        if latest["signal_ts"] != last_sent:
+                            saved_states[sym_key] = latest["signal_ts"]
+                            save_symbol_state(sym_key, latest["signal_ts"])
 
                             msg = (
                                 f"{latest['side']}\n"
                                 f"<b>Инструмент:</b> {cfg['name']} (M5)\n"
-                                f"<b>Время сигнала (Ташкент):</b> <code>{latest['entry_ts']}</code>\n"
-                                f"<b>Вход (Close):</b> <code>{latest['entry']:.2f}</code>\n"
-                                f"<b>Кружок на пивоте ({latest['pivot_ts']}):</b> <code>{latest['pivot']:.2f}</code>\n"
+                                f"<b>Время сигнала (Ташкент):</b> <code>{latest['signal_ts']}</code>\n"
+                                f"<b>Текущая цена (Close):</b> <code>{latest['cur_price']:.2f}</code>\n"
+                                f"<b>Экстремум разворота ({latest['pivot_ts']}):</b> <code>{latest['pivot']:.2f}</code>\n"
                                 f"<b>Ориентир SL:</b> <code>{latest['sl']:.2f}</code> | <b>TP:</b> <code>{latest['tp']:.2f}</code>"
                             )
-                            print(f"\n[СИГНАЛ] {cfg['name']}:")
+                            print(f"\n[МОМЕНТАЛЬНЫЙ СИГНАЛ] {cfg['name']}:")
                             print(msg)
                             send_telegram(msg)
             except Exception as e:
